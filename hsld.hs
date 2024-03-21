@@ -2,7 +2,9 @@ import Control.Monad
 import Data.Binary as B
 import Data.Binary.Get as B
 import qualified Data.ByteString.Lazy as BS
+import qualified Data.ByteString.Lazy.Char8 as BSC
 import Data.Either
+import Data.Maybe
 import Text.Printf (PrintfType, PrintfArg, printf)
 
 type RawElfFile = BS.ByteString
@@ -119,20 +121,64 @@ parseElf64SHeaders eh ef = mapM parse [0 .. (ehSecHdrNum eh) - 1]
   where parse = parseElf64SHeader . secHdr ef
         secHdr = offset (ehSecHdrOff eh) 64
 
-type ElfShStrTab = BS.ByteString
-parseElfShStrTab :: [Elf64SHeader] -> Elf64EHeader -> BS.ByteString ->
+getSecData :: Elf64SHeader -> BS.ByteString -> BS.ByteString
+getSecData sh ef = sizedChunk1 (shSize sh) $ offset1 (shOff sh) ef
+
+type ElfStrTab = BS.ByteString
+parseElfStrTab :: [Elf64SHeader] -> Elf64EHeader -> BS.ByteString ->
                     ElfShStrTab
-parseElfShStrTab hs eh ef =
-  sizedChunk1 (shSize hdr) $ offset1 (shOff hdr) ef
+parseElfStrTab hs eh ef =
+  getSecData hdr ef
   where hdr = hs !! (fromIntegral $ ehSecStrSecIdx eh)
 
+parseElfShStrTab = parseElfStrTab
+
+type ElfShStrTab = ElfStrTab
 peekNullTermStr :: BS.ByteString -> BS.ByteString
 peekNullTermStr = BS.takeWhile (/= 0)
 
-type ElfSecName = BS.ByteString
-getElfSecName :: ElfShStrTab -> Elf64SHeader -> ElfSecName
-getElfSecName tab h = peekNullTermStr $ offset1 (shNameOff h) tab
+type ElfName = BS.ByteString
+getElfName :: (Integral a) => ElfStrTab -> a -> ElfName
+getElfName tab off = peekNullTermStr $ offset1 (fromIntegral off) tab
 
+data Elf64Sym = Elf64Sym {
+  esNameOff     :: !Word32,
+  esInfo        :: !Word8,
+  esOther       :: !Word8,
+  esSecHdrIdx   :: !Word16,
+  esValue       :: !Word64,
+  esSize        :: !Word64
+}
+
+instance Show Elf64Sym where
+  show = showTable [
+    ("Name", forShow esNameOff),
+    ("Info", hexShow esInfo),
+    ("Other", hexShow esOther),
+    ("Section Header Index", forShow esSecHdrIdx),
+    ("Value", hexShow esValue),
+    ("Size", hexShow esSize) ]
+
+getElf64Sym :: B.Get Elf64Sym
+getElf64Sym = do
+  name          <- B.getWord32le
+  info          <- B.getWord8
+  other         <- B.getWord8
+  secHdrIdx     <- B.getWord16le
+  value         <- B.getWord64le
+  size          <- B.getWord64le
+  return $ Elf64Sym name info other secHdrIdx value size
+
+parseElf64Sym :: BS.ByteString -> Either String Elf64Sym
+parseElf64Sym = parseBinary getElf64Sym
+
+parseElf64SymTab :: BS.ByteString -> Either String [Elf64Sym]
+parseElf64SymTab raw =
+  mapM (parseElf64Sym . offset 0 24 raw) [0..(n - 1)]
+  where n = (BS.length raw) `div` 24
+
+getElf64SymNames :: [Elf64Sym] -> BS.ByteString -> [BS.ByteString]
+getElf64SymNames ss tab = map ((getElfName tab) . esNameOff) ss
 
 fromRight' = fromRight undefined
 
@@ -146,7 +192,20 @@ main = do
   putStr $ show $ shs !! 1
   let sst = parseElfShStrTab shs eh p
   putStrLn "==== Section String Table ===="
-  putStrLn $ show $ sst
-  let names = map (getElfSecName sst) shs
+  putStrLn $ show sst
+  let secNames = map ((getElfName sst) . shNameOff) shs
   putStrLn "==== All Section Names ===="
-  mapM_ (putStrLn . show) names
+  mapM_ (putStrLn . show) secNames
+  let shs' = zip secNames shs
+      hStrTab = fromJust $ lookup (BSC.pack ".strtab") shs'
+      strTab = getSecData hStrTab p
+      hSymTab = fromJust $ lookup (BSC.pack ".symtab") shs'
+      rawSymTab = getSecData hSymTab p
+      symTab = fromRight' $ parseElf64SymTab rawSymTab
+      symNames = getElf64SymNames symTab strTab
+  putStrLn "==== String Table ===="
+  putStrLn $ show strTab
+  putStrLn "==== Symbol Table ===="
+  putStrLn $ show symTab
+  putStrLn "==== Symbol Names ===="
+  mapM_ (putStrLn . show) symNames
