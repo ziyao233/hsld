@@ -1,11 +1,17 @@
 import Control.Monad
 import Data.Binary as B
 import Data.Binary.Get as B
+import Data.Binary.Put as B
+import Data.Binary.Builder as BB
+import Data.Bits ((.&.), (.>>.))
+import qualified Data.Map as M
 import qualified Data.ByteString.Lazy as BS
 import qualified Data.ByteString.Lazy.Char8 as BSC
 import Data.Either
 import Data.Maybe
 import Text.Printf (PrintfType, PrintfArg, printf)
+
+import qualified Debug.Trace as D
 
 type RawElfFile = BS.ByteString
 
@@ -16,6 +22,7 @@ data Elf64EHeader = Elf64EHeader {
   ehEntry         :: !Word64,
   ehPrgHdrOff     :: !Word64,
   ehSecHdrOff     :: !Word64,
+  ehFlags         :: !Word32,
   ehPrgHdrNum     :: !Word16,
   ehSecHdrNum     :: !Word16,
   ehSecStrSecIdx  :: !Word16
@@ -37,6 +44,7 @@ instance Show Elf64EHeader where
     ("EntryPoint", hexShow ehEntry),
     ("Program Header Offset", forShow ehPrgHdrOff),
     ("Section Header Offset", forShow ehSecHdrOff),
+    ("Flags", hexShow ehFlags),
     ("Program header Number", forShow ehPrgHdrNum),
     ("Section header Number", forShow ehSecHdrNum),
     ("Section Name String Table Index", forShow ehSecStrSecIdx) ]
@@ -44,15 +52,16 @@ instance Show Elf64EHeader where
 getElf64EHeader :: B.Get Elf64EHeader
 getElf64EHeader = do
   B.skip $ 16 + 2 + 2 + 4
-  entry     <- getWord64le
-  prgHrdOff <- getWord64le
-  secHrdOff <- getWord64le
-  B.skip $ 4 + 2 + 2
-  prgHrdNum <- getWord16le
-  skip 2
-  secHrdNum <- getWord16le
-  secStrSecIdx <- getWord16le
-  return $ Elf64EHeader entry prgHrdOff secHrdOff prgHrdNum secHrdNum
+  entry     <- B.getWord64le
+  prgHrdOff <- B.getWord64le
+  secHrdOff <- B.getWord64le
+  flags     <- B.getWord32le
+  B.skip $ 2 + 2
+  prgHrdNum <- B.getWord16le
+  B.skip 2
+  secHrdNum <- B.getWord16le
+  secStrSecIdx <- B.getWord16le
+  return $ Elf64EHeader entry prgHrdOff secHrdOff flags prgHrdNum secHrdNum
                         secStrSecIdx
 
 parseBinary :: B.Get a -> BS.ByteString -> Either String a
@@ -141,6 +150,28 @@ type ElfName = BS.ByteString
 getElfName :: (Integral a) => ElfStrTab -> a -> ElfName
 getElfName tab off = peekNullTermStr $ offset1 (fromIntegral off) tab
 
+data Elf64PHeader = Elf64PHeader {
+  epType        :: !Word32,
+  epFlags       :: !Word32,
+  epOffset      :: !Word64,
+  epVAddr       :: !Word64,
+  epPAddr       :: !Word64,
+  epFileSize    :: !Word64,
+  epMemSize     :: !Word64,
+  epAlign       :: !Word64
+}
+
+instance Show Elf64PHeader where
+  show = showTable [
+    ("Type", hexShow epType),
+    ("Flags", hexShow epFlags),
+    ("Offset", hexShow epOffset),
+    ("Virtual Address", hexShow epVAddr),
+    ("Physical Address", hexShow epPAddr),
+    ("Size in File", forShow epFileSize),
+    ("Size in Memory", forShow epMemSize),
+    ("Alignment", hexShow epAlign) ]
+
 data Elf64Sym = Elf64Sym {
   esNameOff     :: !Word32,
   esInfo        :: !Word8,
@@ -180,6 +211,70 @@ parseElf64SymTab raw =
 getElf64SymNames :: [Elf64Sym] -> BS.ByteString -> [BS.ByteString]
 getElf64SymNames ss tab = map ((getElfName tab) . esNameOff) ss
 
+-- Elf64_Rel and Elf64_Rela is represented as the same type
+data Elf64Rel = Elf64Rel {
+  erOffset      :: !Word64,
+  erInfo        :: !Word64,
+  erAddend      :: !Word64
+} deriving (Show)
+
+erType :: Elf64Rel -> Word64
+erType = (.&. 0xffffffff) . erInfo
+
+erIndex :: Elf64Rel -> Word64
+erIndex = (.>>. 32) . erInfo
+
+getElf64Rel :: B.Get Elf64Rel
+getElf64Rel = do
+  offset <- B.getWord64le
+  info   <- B.getWord64le
+  return $ Elf64Rel offset info 0
+
+getElf64Rela :: B.Get Elf64Rel
+getElf64Rela = do
+  offset <- B.getWord64le
+  info   <- B.getWord64le
+  addend <- B.getWord64le
+  return $ Elf64Rel offset info addend
+
+parseElf64Rel = parseBinary getElf64Rel
+parseElf64Rela = parseBinary getElf64Rela
+
+parseElf64Rels :: Elf64SHeader -> BS.ByteString -> Either String [Elf64Rel]
+parseElf64Rels h p =
+  mapM (parseElf64Rel . offset start 16 p) [0 .. (n - 1)]
+  where n     = (shSize h) `div` (fromIntegral 16)
+        start = shOff h
+
+parseElf64Relas :: Elf64SHeader -> BS.ByteString -> Either String [Elf64Rel]
+parseElf64Relas h p =
+  mapM (parseElf64Rela . offset start 24 p) [0 .. (n - 1)]
+  where n     = (shSize h) `div` (fromIntegral 24)
+        start = shOff h
+
+newtype ElfLayout = ElfLayout {
+  elSecStart    :: Word64
+}
+
+data Relocator = Relocator8  (ElfLayout -> Elf64Rel -> Elf64Sym -> Word8)
+               | Relocator16 (ElfLayout -> Elf64Rel -> Elf64Sym -> Word16)
+               | Relocator32 (ElfLayout -> Elf64Rel -> Elf64Sym -> Word32)
+               | Relocator64 (ElfLayout -> Elf64Rel -> Elf64Sym -> Word64)
+
+rel32S el r sym = fromIntegral $ (esValue sym) + (erAddend r) + s
+  where s = fromIntegral $ elSecStart el
+
+relocators = [
+  (11, Relocator32 rel32S) ]
+
+relocate :: [Elf64Sym] -> ElfLayout -> Elf64Rel -> BS.ByteString
+relocate symTab el r =
+  case relocator of
+    Relocator32 f -> B.encode $ f el r sym
+  where relocator = fromJust $ lookup (erType r) relocators
+        sym       = symTab !! (fromIntegral $ erIndex r)
+
+
 fromRight' = fromRight undefined
 
 main = do
@@ -209,3 +304,13 @@ main = do
   putStrLn $ show symTab
   putStrLn "==== Symbol Names ===="
   mapM_ (putStrLn . show) symNames
+
+  let shRela = fromJust $ lookup (BSC.pack ".rela.text") shs'
+  let rels   = fromRight' $ parseElf64Relas shRela p
+  putStrLn "==== Relocs ===="
+  mapM_ (putStrLn . show) rels
+
+  let layout  = ElfLayout 0x400000
+  let rels'   = map (relocate symTab layout) rels
+  putStrLn "==== Relocation result ===="
+  mapM_ (putStrLn . hexShow (B.decode :: BS.ByteString -> Word32)) rels'
